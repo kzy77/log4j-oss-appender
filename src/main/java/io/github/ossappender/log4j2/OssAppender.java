@@ -12,6 +12,8 @@ import org.apache.logging.log4j.core.config.plugins.PluginAttribute;
 import org.apache.logging.log4j.core.config.plugins.PluginBuilderFactory;
 import org.apache.logging.log4j.core.config.plugins.validation.constraints.Required;
 import org.apache.logging.log4j.core.layout.PatternLayout;
+import org.apache.logging.log4j.Logger;
+import org.apache.logging.log4j.LogManager;
 
 import java.io.Serializable;
 import java.nio.charset.Charset;
@@ -23,7 +25,10 @@ import java.util.List;
 @Plugin(name = "OssAppender", category = "Core", elementType = "appender", printObject = true)
 public class OssAppender extends AbstractAppender {
 
-    private final BatchingQueue queue;
+    private static final Logger logger = LogManager.getLogger(OssAppender.class);
+
+    private final BatchingQueue batchingQueue;
+    private final io.github.ossappender.core.DisruptorBatchingQueue disruptorQueue;
     private final OssUploader uploader;
     private final boolean blockOnFull;
     private final UploadHooks hooks;
@@ -32,33 +37,55 @@ public class OssAppender extends AbstractAppender {
                           Filter filter,
                           Layout<? extends Serializable> layout,
                           boolean ignoreExceptions,
-                          BatchingQueue queue,
+                          BatchingQueue batchingQueue,
+                          io.github.ossappender.core.DisruptorBatchingQueue disruptorQueue,
                           OssUploader uploader,
                           boolean blockOnFull,
                           UploadHooks hooks) {
         super(name, filter, layout, ignoreExceptions);
-        this.queue = queue;
+        this.batchingQueue = batchingQueue;
+        this.disruptorQueue = disruptorQueue;
         this.uploader = uploader;
         this.blockOnFull = blockOnFull;
         this.hooks = hooks;
-        this.queue.start();
     }
 
     @Override
     public void append(LogEvent event) {
-        byte[] bytes = getLayout().toByteArray(event);
-        boolean accepted = queue.offer(bytes);
-        if (!accepted && !blockOnFull) {
-            // 队列满且未阻塞，触发丢弃回调
-            hooks.onDropped(bytes.length, -1);
+        try {
+            byte[] bytes = getLayout().toByteArray(event);
+            boolean accepted;
+            if (batchingQueue != null) {
+                accepted = batchingQueue.offer(bytes);
+            } else {
+                accepted = disruptorQueue.offer(bytes);
+            }
+            if (!accepted && !blockOnFull) {
+                hooks.onDropped(bytes.length, -1);
+            }
+        } catch (Throwable throwable) {
+            // Log the exception but don't throw it to avoid affecting business threads
+            logger.warn("Failed to append log event to queue", throwable);
         }
     }
 
     @Override
     public void stop() {
         super.stop();
-        try { queue.close(); } catch (Throwable ignore) {}
-        try { uploader.close(); } catch (Throwable ignore) {}
+        try {
+            if (batchingQueue != null) {
+                batchingQueue.close();
+            } else {
+                disruptorQueue.close();
+            }
+        } catch (Throwable throwable) {
+            logger.warn("Failed to close queue", throwable);
+        }
+        try { 
+            uploader.close(); 
+        } catch (Throwable throwable) {
+            logger.warn("Failed to close uploader", throwable);
+        }
     }
 
     /**
@@ -82,6 +109,8 @@ public class OssAppender extends AbstractAppender {
         @PluginAttribute("batchMaxBytes") private int batchMaxBytes = 1024 * 512;
         @PluginAttribute("flushIntervalMs") private long flushIntervalMs = 2000;
         @PluginAttribute("blockOnFull") private boolean blockOnFull = true;
+        @PluginAttribute("useDisruptor") private boolean useDisruptor = false;
+        @PluginAttribute("multiProducer") private boolean multiProducer = true;
 
         // Retry & gzip
         @PluginAttribute("gzipEnabled") private boolean gzipEnabled = true;
@@ -113,19 +142,42 @@ public class OssAppender extends AbstractAppender {
                     hooks
             );
 
-            BatchingQueue batchingQueue = new BatchingQueue(
-                    queueCapacity,
-                    batchMaxMessages,
-                    batchMaxBytes,
-                    flushIntervalMs,
-                    blockOnFull,
-                    (List<io.github.ossappender.core.BatchingQueue.LogEvent> events, int totalBytes) -> {
-                        uploader.uploadBatch(events, totalBytes);
-                        return true;
-                    }
-            );
+            if (useDisruptor) {
+                io.github.ossappender.core.DisruptorBatchingQueue disruptorQueue = new io.github.ossappender.core.DisruptorBatchingQueue(
+                        nearestPowerOfTwo(queueCapacity),
+                        batchMaxMessages,
+                        batchMaxBytes,
+                        flushIntervalMs,
+                        blockOnFull,
+                        multiProducer,
+                        (List<io.github.ossappender.core.BatchingQueue.LogEvent> events, int totalBytes) -> {
+                            uploader.uploadBatch(events, totalBytes);
+                            return true;
+                        }
+                );
+                disruptorQueue.start();
+                return new OssAppender(name, filter, effectiveLayout, true, null, disruptorQueue, uploader, blockOnFull, hooks);
+            } else {
+                BatchingQueue batchingQueue = new BatchingQueue(
+                        queueCapacity,
+                        batchMaxMessages,
+                        batchMaxBytes,
+                        flushIntervalMs,
+                        blockOnFull,
+                        (List<io.github.ossappender.core.BatchingQueue.LogEvent> events, int totalBytes) -> {
+                            uploader.uploadBatch(events, totalBytes);
+                            return true;
+                        }
+                );
+                batchingQueue.start();
+                return new OssAppender(name, filter, effectiveLayout, true, batchingQueue, null, uploader, blockOnFull, hooks);
+            }
+        }
 
-            return new OssAppender(name, filter, effectiveLayout, true, batchingQueue, uploader, blockOnFull, hooks);
+        private int nearestPowerOfTwo(int n) {
+            int x = 1;
+            while (x < n) x <<= 1;
+            return x;
         }
 
         /**
